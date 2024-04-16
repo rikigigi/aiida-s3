@@ -20,7 +20,7 @@ classifiers = [
   'Topic :: Scientific/Engineering'
 ]
 dependencies = [
-  'aiida-core@git+https://github.com/sphuber/aiida-core@feature/improved-profile-fixtures',
+  'aiida-core@git+https://github.com/rikigigi/aiida-core@main',
   'azure-storage-blob',
   'boto3'
 ]
