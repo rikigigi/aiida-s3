@@ -20,7 +20,7 @@ classifiers = [
   'Topic :: Scientific/Engineering'
 ]
 dependencies = [
-  'aiida-core@git+https://github.com/rikigigi/aiida-core@main',
+  'aiida-core@git+https://github.com/rikigigi/aiida-core@fix_upload_calculation',
   'azure-storage-blob',
   'boto3'
 ]
