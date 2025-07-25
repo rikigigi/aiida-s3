@@ -79,7 +79,7 @@ class S3RepositoryBackend(AbstractRepositoryBackend):
     def key_format(self) -> str | None:
         """Return the format for the keys of the repository."""
         return 'uuid4'
-
+    
     @property
     def archive_format(self) -> str | None:
         """Return the format of the archive."""
@@ -90,15 +90,10 @@ class S3RepositoryBackend(AbstractRepositoryBackend):
         if not self._bucket_exists:
             return
 
-        # Batch delete objects in chunks of 1000 (S3 API limit)
-        keys = list(self.list_objects())
-        batch_size = 1000
-        for i in range(0, len(keys), batch_size):
-            self.delete_objects(keys[i:i+batch_size])
-
+        self.delete_objects(list(self.list_objects()))
         self._client.delete_bucket(Bucket=self._bucket_name)
 
-    def _put_object_from_filelike(self, handle: t.BinaryIO, key=None) -> str:
+    def _put_object_from_filelike(self, handle: t.BinaryIO, key = None) -> str:
         """Store the byte contents of a file in the repository.
 
         :param handle: filelike object with the byte content to be stored.
@@ -108,7 +103,7 @@ class S3RepositoryBackend(AbstractRepositoryBackend):
         """
         if key is None:
             key = str(uuid.uuid4())
-
+            
         self._client.put_object(Bucket=self._bucket_name, Body=handle, Key=key)
         return key
 

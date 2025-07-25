@@ -91,12 +91,11 @@ class AzureBlobStorageRepositoryBackend(AbstractRepositoryBackend):
 
         self._container_client.delete_container()
 
-    def _put_object_from_filelike(self, handle: t.BinaryIO, key: str | None = None) -> str:
+    def _put_object_from_filelike(self, handle: t.BinaryIO, key : str | None = None) -> str:
         """Store the byte contents of a file in the repository.
 
         :param handle: filelike object with the byte content to be stored.
-        :param key: fully qualified identifier for the object within the repository.
-                    If not provided,a new key will be generated.
+        :param key: fully qualified identifier for the object within the repository. If not provided, a new key will be generated.
         :return: the generated fully qualified identifier for the object within the repository.
         :raises TypeError: if the handle is not a byte stream.
         """
