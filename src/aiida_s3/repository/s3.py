@@ -13,6 +13,8 @@ from aiida.repository.backend.abstract import AbstractRepositoryBackend
 
 __all__ = ('S3RepositoryBackend',)
 
+MAX_DELETE_OBJECTS = 1000
+
 
 class S3RepositoryBackend(AbstractRepositoryBackend):
     """Implementation of the ``AbstractRepositoryBackend`` using S3 as the backend."""
@@ -79,7 +81,7 @@ class S3RepositoryBackend(AbstractRepositoryBackend):
     def key_format(self) -> str | None:
         """Return the format for the keys of the repository."""
         return 'uuid4'
-    
+
     @property
     def archive_format(self) -> str | None:
         """Return the format of the archive."""
@@ -90,20 +92,28 @@ class S3RepositoryBackend(AbstractRepositoryBackend):
         if not self._bucket_exists:
             return
 
-        self.delete_objects(list(self.list_objects()))
+        objects = []
+        for key in self.list_objects():
+            objects.append(key)
+            if len(objects) == MAX_DELETE_OBJECTS:
+                self.delete_objects(objects)
+                objects = []
+
+        self.delete_objects(objects)
         self._client.delete_bucket(Bucket=self._bucket_name)
 
-    def _put_object_from_filelike(self, handle: t.BinaryIO, key = None) -> str:
+    def _put_object_from_filelike(self, handle: t.BinaryIO, key=None) -> str:
         """Store the byte contents of a file in the repository.
 
         :param handle: filelike object with the byte content to be stored.
-        :param key: fully qualified identifier for the object within the repository. If not provided, a new key will be generated.
+        :param key: fully qualified identifier for the object within the repository.
+                    If not provided, a new key will be generated.
         :return: the generated fully qualified identifier for the object within the repository.
         :raises TypeError: if the handle is not a byte stream.
         """
         if key is None:
             key = str(uuid.uuid4())
-            
+
         self._client.put_object(Bucket=self._bucket_name, Body=handle, Key=key)
         return key
 
@@ -130,14 +140,14 @@ class S3RepositoryBackend(AbstractRepositoryBackend):
         :raise OSError: if the file could not be opened.
         """
         try:
-            with tempfile.TemporaryFile() as handle:
+            with tempfile.NamedTemporaryFile() as handle:
                 self._client.download_fileobj(self._bucket_name, key, handle)
                 handle.seek(0)
                 yield handle
         except botocore.exceptions.ClientError as exception:
             raise FileNotFoundError(f'object with key `{key}` does not exist.') from exception
 
-    def iter_object_streams(self, keys: list[str]) -> t.Iterator[tuple[str, t.IO[bytes]]]:  # type: ignore[override]
+    def iter_object_streams(self, keys: list[str]) -> t.Iterator[tuple[str, t.IO[bytes]]]:  # tyZpe: ignore[override]
         """Return an iterator over the (read-only) byte streams of objects identified by key.
 
         .. note:: handles should only be read within the context of this iterator.
@@ -159,8 +169,13 @@ class S3RepositoryBackend(AbstractRepositoryBackend):
         :raise OSError: if any of the files could not be deleted.
         """
         super().delete_objects(keys)
+
+        # Generate content md5
+
+        delete_payload = {'Objects': [{'Key': key} for key in keys], 'Quiet': True}
+
         if keys:
-            self._client.delete_objects(Bucket=self._bucket_name, Delete={'Objects': [{'Key': key} for key in keys]})
+            self._client.delete_objects(Bucket=self._bucket_name, Delete=delete_payload)
 
     def list_objects(self) -> t.Iterable[str]:
         """Return iterable that yields all available objects by key.
