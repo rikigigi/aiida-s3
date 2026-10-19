@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import typing as t
 
+from aiida.common.pydantic import MetadataField
 from aiida.storage.psql_dos.backend import PsqlDosBackend
 from aiida.storage.psql_dos.migrator import PsqlDosMigrator
-from pydantic import Field
 
 from ..repository.s3 import S3RepositoryBackend
 
@@ -60,22 +60,22 @@ class PsqlS3Storage(PsqlDosBackend):
 
     migrator = PsqlS3StorageMigrator
 
-    class Model(PsqlDosBackend.Model):
+    class CliModel(PsqlDosBackend.CliModel):
         """Model describing required information to configure an instance of the storage."""
 
-        endpoint_url: str = Field(
+        endpoint_url: str = MetadataField(
             title='Server endpoint URL',
             description='The endpoint URL of the server to connect to.',
         )
-        access_key_id: str = Field(
+        access_key_id: str = MetadataField(
             title='Access key ID',
             description='The access key ID.',
         )
-        secret_access_key: str = Field(
+        secret_access_key: str = MetadataField(
             title='Secret access key',
             description='The secret access key.',
         )
-        bucket_name: str = Field(
+        bucket_name: str = MetadataField(
             title='Bucket name',
             description='The name of the S3 bucket to use.',
         )
