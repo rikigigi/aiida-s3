@@ -37,6 +37,7 @@ class PsqlAzureBlobStorage(PsqlDosBackend):
     """Storage backend using PostgresSQL and Azure Blob Storage."""
 
     migrator = PsqlAzureBlobStorageMigrator
+    _repository: AzureBlobStorageRepositoryBackend | None = None
 
     class CliModel(PsqlDosBackend.CliModel):
         """Model describing required information to configure an instance of the storage."""
@@ -56,4 +57,6 @@ class PsqlAzureBlobStorage(PsqlDosBackend):
 
         :returns: The repository of the configured profile.
         """
-        return self.migrator(self.profile).get_repository()
+        if self._repository is None:
+            self._repository = self.migrator(self.profile).get_repository()
+        return self._repository
