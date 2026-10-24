@@ -38,6 +38,71 @@ This can be done through AiiDA's CLI `verdi`:
     verdi -p profile-name devel launch-add
     ```
 
+## Shared repositories
+
+Any profile using the `s3.psql_s3` storage backend can reference any number of **read-only shared repositories**:
+S3 buckets that many separated profiles can reference. This is useful for data that is needed everywhere, such as
+pseudopotentials or other common data files. The central invariant:
+
+> No S3 upload, download, or key modification ever happens against a shared bucket.
+> Shared objects are referenced by key; the bytes live only in the shared bucket, once.
+
+The feature builds on the `archive_format`/`maintain_keys` machinery of the patched `aiida-core` that this branch
+targets (2.9.3 plus the UUID4-key archive patches): on stock `aiida-core`, importing a shared archive regenerates the
+object keys and the import fails the post-verification loudly.
+
+### Registering a shared repository
+
+A shared repository is registered in the profile's storage configuration under the optional `shared_repositories`
+entry, managed through the `aiida-s3` CLI:
+
+```bash
+aiida-s3 shared add --name common-data --endpoint-url http://minio.internal:9000 \
+                    --access-key-id read-only-key --secret-access-key ... \
+                    --bucket-name shared-bucket
+aiida-s3 shared list
+aiida-s3 shared remove --name common-data
+```
+
+The `name` is baked into the object keys of imported nodes (`shared/<name>/<object-key>`) and must be treated as an
+immutable identifier: renaming a registration breaks the routing. Read-only enforcement is IAM-first: give importing
+profiles credentials with `s3:GetObject` on the shared bucket only. The plugin raises `PermissionError` if code tries
+to delete shared objects, but that is UX, not security.
+
+### Sharing data with other profiles
+
+On the exporting profile:
+
+```bash
+aiida-s3 export-shared --name common-data --all -o common-data.aiida-shared
+```
+
+The archive contains the entities (nodes, groups, links) and a manifest with the bucket coordinates, but **no object
+bytes**. On the importing profile:
+
+```bash
+aiida-s3 import-shared common-data.aiida-shared --register
+```
+
+The import registers the shared repository from the archive manifest (credentials are prompted for; they are never
+stored in the archive) and imports the entities such that their files reference the shared bucket by key. No S3
+download or upload of object bytes occurs on either side.
+
+Use `verdi archive export`/`import` for self-contained copies that embed the object bytes. Note that a vanilla
+archive exported from a profile that references shared objects materializes those objects as plain local objects in
+the importing profile: use `aiida-s3 export-shared`/`import-shared` to preserve the references instead.
+
+### Caveats
+
+* Garbage collection of the shared bucket is admin-owned: no profile can delete shared objects, so no profile can
+  decide when they are unreferenced. Deleting from the shared bucket while profiles still reference a key leaves
+  dangling references that surface as `FileNotFoundError` on access.
+* The importing profile must be able to reach the shared bucket (same S3 server, VPC peering, or a public read-only
+  bucket). For an air-gapped target, sync the bucket once out of band (e.g. `aws s3 sync` or bucket replication) and
+  point the shared repository registration at the mirror.
+* Exporting nodes that themselves reference shared objects is refused: the bytes would not be reachable through the
+  exported bucket.
+
 ## Testing
 
 The unit tests are implemented and run with [`pytest`](https://docs.pytest.org/).
