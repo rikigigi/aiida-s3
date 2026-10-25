@@ -19,7 +19,14 @@ MAX_DELETE_OBJECTS = 1000
 class S3RepositoryBackend(AbstractRepositoryBackend):
     """Implementation of the ``AbstractRepositoryBackend`` using S3 as the backend."""
 
-    def __init__(self, endpoint_url: str, access_key_id: str, secret_access_key: str, bucket_name: str):
+    def __init__(
+        self,
+        endpoint_url: str,
+        access_key_id: str,
+        secret_access_key: str,
+        bucket_name: str,
+        region_name: str | None = None,
+    ):
         """Construct a new instance for a given bucket.
 
         .. note:: It is possible to construct an instance for a bucket that doesn't exist yet. To use the backend,
@@ -30,13 +37,18 @@ class S3RepositoryBackend(AbstractRepositoryBackend):
         :param access_key_id: The access key ID to use to authenticate with S3.
         :param secret_access_key: The secret access key to use to authenticate with S3.
         :param bucket_name: The name of the bucket to use.
+        :param region_name: The region name to use for the bucket. Required for bucket creation with region-specific
+            endpoints (e.g., moto, MinIO, SeaweedFS). If ``None``, no ``LocationConstraint`` is set when creating
+            the bucket, which works for AWS S3 ``us-east-1`` but fails for other regions and S3-compatible services.
         """
         self._bucket_name = bucket_name
+        self._region_name = region_name
         self._client = boto3.client(
             's3',
             endpoint_url=endpoint_url,
             aws_access_key_id=access_key_id,
             aws_secret_access_key=secret_access_key,
+            region_name=region_name,
         )
 
     def __str__(self) -> str:
@@ -69,6 +81,9 @@ class S3RepositoryBackend(AbstractRepositoryBackend):
         """
         if self.is_initialised:
             return
+
+        if self._region_name is not None and 'CreateBucketConfiguration' not in kwargs:
+            kwargs['CreateBucketConfiguration'] = {'LocationConstraint': self._region_name}
 
         self._client.create_bucket(Bucket=self._bucket_name, **kwargs)
 

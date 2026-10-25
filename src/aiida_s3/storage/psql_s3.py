@@ -21,6 +21,9 @@ def construct_repository(storage_config: dict[str, t.Any]) -> S3RepositoryBacken
     the shared repository registered under ``<name>``. Otherwise, a plain
     :class:`aiida_s3.repository.s3.S3RepositoryBackend` is returned.
 
+    The optional ``soft_delete_shared`` entry (default: ``True``) controls whether deletion of shared-namespaced
+    keys is silently skipped (preserving the S3 objects in the shared buckets) or raises ``PermissionError``.
+
     :param storage_config: the storage configuration of the profile.
     :return: the file repository backend instance.
     """
@@ -29,6 +32,7 @@ def construct_repository(storage_config: dict[str, t.Any]) -> S3RepositoryBacken
         access_key_id=storage_config['access_key_id'],
         secret_access_key=storage_config['secret_access_key'],
         bucket_name=storage_config['bucket_name'],
+        region_name=storage_config.get('region_name'),
     )
 
     shared_config = storage_config.get('shared_repositories')
@@ -42,10 +46,15 @@ def construct_repository(storage_config: dict[str, t.Any]) -> S3RepositoryBacken
             access_key_id=config['access_key_id'],
             secret_access_key=config['secret_access_key'],
             bucket_name=config['bucket_name'],
+            region_name=config.get('region_name', storage_config.get('region_name')),
         )
         for config in shared_config
     }
-    return MultiS3RepositoryBackend(primary, shared)
+    return MultiS3RepositoryBackend(
+        primary,
+        shared,
+        soft_delete_shared=storage_config.get('soft_delete_shared', True),
+    )
 
 
 class PsqlS3StorageMigrator(PsqlDosMigrator):

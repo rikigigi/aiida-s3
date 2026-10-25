@@ -51,16 +51,33 @@ class MultiS3RepositoryBackend(AbstractRepositoryBackend):
 
     The central invariant: no S3 upload, download or key modification ever happens against a shared bucket. Shared
     objects are referenced by key; the bytes live only in the shared bucket, once.
+
+    Deletion of shared objects is controlled by ``soft_delete_shared``:
+
+    * ``soft_delete_shared=True`` (default): shared keys are silently skipped during deletion. The database record
+      is removed, but the S3 object in the shared bucket is preserved for other profiles. This allows nodes
+      referencing shared data to be deleted normally.
+    * ``soft_delete_shared=False``: attempting to delete a shared key raises ``PermissionError``. Use this when
+      shared objects must be strictly protected from any deletion attempt.
     """
 
-    def __init__(self, primary: S3RepositoryBackend, shared: dict[str, S3RepositoryBackend] | None = None):
+    def __init__(
+        self,
+        primary: S3RepositoryBackend,
+        shared: dict[str, S3RepositoryBackend] | None = None,
+        soft_delete_shared: bool = True,
+    ):
         """Construct a new instance.
 
         :param primary: the read-write backend for all objects owned by this profile.
         :param shared: mapping of shared repository name to read-only backend.
+        :param soft_delete_shared: if ``True`` (default), deletion of shared-namespaced keys is silently skipped
+            (the S3 object in the shared bucket is preserved). If ``False``, deletion of shared keys raises
+            ``PermissionError``.
         """
         self._primary = primary
         self._shared = dict(shared or {})
+        self._soft_delete_shared = soft_delete_shared
 
     def __str__(self) -> str:
         """Return the string representation of this repository."""
@@ -208,16 +225,34 @@ class MultiS3RepositoryBackend(AbstractRepositoryBackend):
     def delete_objects(self, keys: list[str]) -> None:
         """Delete the objects from the repository.
 
+        Shared-namespaced keys (``shared/<name>/<object-key>``) are handled according to ``soft_delete_shared``:
+
+        * if ``soft_delete_shared`` is ``True`` (default), shared keys are silently filtered out: the S3 objects
+          in the shared buckets are preserved, only the database records are removed by the caller.
+        * if ``soft_delete_shared`` is ``False``, any shared key in the list raises ``PermissionError``.
+
         :param keys: list of fully qualified identifiers for the objects within the repository.
-        :raises PermissionError: if any of the keys is namespaced for a shared repository, since shared
-            repositories are read-only.
+        :raises PermissionError: if ``soft_delete_shared`` is ``False`` and any key is namespaced for a shared
+            repository.
         """
-        shared_keys = [key for key in keys if split_shared_key(key) is not None]
-        if shared_keys:
-            raise PermissionError(
-                f'Cannot delete objects in shared repositories: {shared_keys}. Shared repositories are read-only.'
-            )
-        self._primary.delete_objects(keys)
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        primary_keys: list[str] = []
+        for key in keys:
+            if split_shared_key(key) is not None:
+                if not self._soft_delete_shared:
+                    raise PermissionError(
+                        f'Cannot delete object in shared repository: {key}. '
+                        'Shared repositories are read-only (soft_delete_shared=False).'
+                    )
+                logger.info('Soft-deleting shared object %s (object preserved in shared bucket)', key)
+            else:
+                primary_keys.append(key)
+
+        if primary_keys:
+            self._primary.delete_objects(primary_keys)
 
     def list_objects(self) -> t.Iterable[str]:
         """Return iterable that yields all available objects by key.

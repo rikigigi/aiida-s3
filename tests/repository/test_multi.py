@@ -32,8 +32,17 @@ def primary_repository(s3_bucket_name, s3_config) -> S3RepositoryBackend:
 
 @pytest.fixture
 def repository(primary_repository, shared_repository) -> MultiS3RepositoryBackend:
-    """Return an initialised multi backend with one shared repository registered as ``common``."""
+    """Return an initialised multi backend with one shared repository registered as ``common``.
+
+    Uses the default ``soft_delete_shared=True``: shared keys are silently skipped during deletion.
+    """
     return MultiS3RepositoryBackend(primary_repository, {'common': shared_repository})
+
+
+@pytest.fixture
+def repository_strict(primary_repository, shared_repository) -> MultiS3RepositoryBackend:
+    """Return a multi backend with ``soft_delete_shared=False``: shared key deletion raises."""
+    return MultiS3RepositoryBackend(primary_repository, {'common': shared_repository}, soft_delete_shared=False)
 
 
 def test_split_shared_key():
@@ -198,13 +207,49 @@ def test_has_objects_unknown_shared_name(repository):
         repository.has_objects([make_shared_key('unknown', str(uuid.uuid4()))])
 
 
-def test_delete_objects_shared_raises(repository, shared_repository):
-    """Test that deleting shared-namespaced objects is forbidden."""
+def test_delete_objects_shared_soft(repository, shared_repository):
+    """Test that with ``soft_delete_shared=True`` (default), shared keys are silently skipped.
+
+    The S3 object in the shared bucket is preserved; only the primary deletion proceeds.
+    """
+    with io.BytesIO(b'shared-bytes') as handle:
+        shared_object_key = shared_repository.put_object_from_filelike(handle)
+    with io.BytesIO(b'primary-bytes') as handle:
+        primary_object_key = repository.put_object_from_filelike(handle)
+
+    shared_key = make_shared_key('common', shared_object_key)
+
+    # Deleting a mix of shared and primary keys: shared is skipped, primary is deleted.
+    repository.delete_objects([shared_key, primary_object_key])
+
+    # The shared object is preserved in the shared bucket.
+    assert shared_repository.has_object(shared_object_key)
+    # The primary object is deleted.
+    assert not repository.has_object(primary_object_key)
+
+
+def test_delete_objects_shared_only_soft(repository, shared_repository):
+    """Test that deleting only shared keys with ``soft_delete_shared=True`` is a no-op for S3."""
+    with io.BytesIO(b'shared-bytes') as handle:
+        shared_object_key = shared_repository.put_object_from_filelike(handle)
+
+    shared_key = make_shared_key('common', shared_object_key)
+
+    # Should not raise, and the shared object must be preserved.
+    repository.delete_objects([shared_key])
+    assert shared_repository.has_object(shared_object_key)
+
+
+def test_delete_objects_shared_raises(repository_strict, shared_repository):
+    """Test that with ``soft_delete_shared=False``, deleting shared keys raises ``PermissionError``."""
     with io.BytesIO(b'shared-bytes') as handle:
         object_key = shared_repository.put_object_from_filelike(handle)
 
-    with pytest.raises(PermissionError):
-        repository.delete_objects([make_shared_key('common', object_key)])
+    with pytest.raises(PermissionError, match='soft_delete_shared=False'):
+        repository_strict.delete_objects([make_shared_key('common', object_key)])
+
+    # The shared object is preserved.
+    assert shared_repository.has_object(object_key)
 
 
 def test_delete_objects_primary(repository, shared_repository):
@@ -266,3 +311,70 @@ def test_no_shared_repositories(s3_bucket_name, s3_config):
 
     repository.delete_objects([key])
     assert not repository.has_object(key)
+
+
+def test_construct_repository_soft_delete_shared_default():
+    """Test that ``construct_repository`` defaults to ``soft_delete_shared=True``."""
+    from aiida_s3.storage.psql_s3 import construct_repository
+
+    config = {
+        'endpoint_url': 'http://localhost:9000',
+        'access_key_id': 'test',
+        'secret_access_key': 'test',
+        'bucket_name': 'primary-bucket',
+        'shared_repositories': [
+            {
+                'name': 'common',
+                'endpoint_url': 'http://localhost:9000',
+                'access_key_id': 'test',
+                'secret_access_key': 'test',
+                'bucket_name': 'shared-bucket',
+            }
+        ],
+    }
+
+    repo = construct_repository(config)
+    assert isinstance(repo, MultiS3RepositoryBackend)
+    assert repo._soft_delete_shared is True
+
+
+def test_construct_repository_soft_delete_shared_false():
+    """Test that ``construct_repository`` passes ``soft_delete_shared=False`` when configured."""
+    from aiida_s3.storage.psql_s3 import construct_repository
+
+    config = {
+        'endpoint_url': 'http://localhost:9000',
+        'access_key_id': 'test',
+        'secret_access_key': 'test',
+        'bucket_name': 'primary-bucket',
+        'soft_delete_shared': False,
+        'shared_repositories': [
+            {
+                'name': 'common',
+                'endpoint_url': 'http://localhost:9000',
+                'access_key_id': 'test',
+                'secret_access_key': 'test',
+                'bucket_name': 'shared-bucket',
+            }
+        ],
+    }
+
+    repo = construct_repository(config)
+    assert isinstance(repo, MultiS3RepositoryBackend)
+    assert repo._soft_delete_shared is False
+
+
+def test_construct_repository_no_shared():
+    """Test that ``construct_repository`` returns a plain S3 backend when no shared repositories are configured."""
+    from aiida_s3.storage.psql_s3 import construct_repository
+
+    config = {
+        'endpoint_url': 'http://localhost:9000',
+        'access_key_id': 'test',
+        'secret_access_key': 'test',
+        'bucket_name': 'primary-bucket',
+    }
+
+    repo = construct_repository(config)
+    assert isinstance(repo, S3RepositoryBackend)
+    assert not isinstance(repo, MultiS3RepositoryBackend)
