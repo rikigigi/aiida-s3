@@ -46,14 +46,27 @@ Usage:
         manifest_path=Path("family.json"),
         shared_name="common"
     )
+
+    # Import into an explicitly given backend, without any globally loaded profile
+    # (e.g. the DashboardServer temporal worker, which manages its own aiida
+    # Managers/backends and must not touch global state):
+    import_shared_collection(
+        manifest_path=Path("family.json"),
+        shared_name="common",
+        backend=my_backend_instance,
+    )
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import pathlib
 import typing as t
+
+if t.TYPE_CHECKING:
+    from aiida.orm.implementation.storage_backend import StorageBackend
 
 __all__ = (
     'COLLECTION_FORMAT',
@@ -63,6 +76,8 @@ __all__ = (
 )
 
 COLLECTION_FORMAT = 'aiida-s3-shared-collection/1'
+
+logger = logging.getLogger(__name__)
 
 
 def iter_repository_keys(metadata: dict[str, t.Any], prefix: str = '') -> t.Iterator[tuple[str, str]]:
@@ -90,6 +105,7 @@ def export_shared_collection(
     output: pathlib.Path | str = 'shared_collection.json',
     shared_name: str = 'shared',
     verify: bool = True,
+    backend: StorageBackend | None = None,
 ) -> pathlib.Path:
     """Export Data nodes and Groups as a shared collection manifest.
 
@@ -102,13 +118,17 @@ def export_shared_collection(
     :param shared_name: name under which the source bucket will be registered
         as a shared repository in the importing profile.
     :param verify: whether to verify that all repository objects exist in S3.
+    :param backend: storage backend of the profile owning the nodes. If not specified, the storage of the globally
+        loaded profile is used, which is the natural mode for CLI usage (e.g. in an aiida pod, where the profile is
+        loaded globally). Pass it explicitly when no profile is loaded globally, such as in a service process managing
+        several profiles at once.
     :return: the path to the created manifest file.
     """
     from aiida import orm
     from aiida.manage import get_manager
 
     output = pathlib.Path(output)
-    backend = get_manager().get_profile_storage()
+    backend = backend or get_manager().get_profile_storage()
     repository = backend.get_repository()
     profile = backend.profile
 
@@ -203,8 +223,9 @@ def import_shared_collection(
     shared_name: str | None = None,
     credentials: dict[str, str] | None = None,
     label_prefix: str = '',
+    backend: StorageBackend | None = None,
 ) -> dict[str, t.Any]:
-    """Import a shared collection manifest into the current profile.
+    """Import a shared collection manifest into a profile.
 
     Creates new Data nodes and Groups, with repository files referenced by key
     in the shared S3 bucket. No data is uploaded or downloaded.
@@ -213,10 +234,17 @@ def import_shared_collection(
     :param shared_name: name of the shared repository. If None, uses the name
         from the manifest.
     :param credentials: optional credentials to register the shared repository
-        if not already registered. Dict with ``access_key_id`` and
-        ``secret_access_key``.
+        in the profile configuration of the globally loaded profile. Requires
+        a globally loaded profile and is therefore incompatible with an
+        explicit ``backend``.
     :param label_prefix: optional prefix to add to group labels (to avoid conflicts).
-    :return: dict with ``data_nodes`` and ``groups`` lists of imported entities.
+    :param backend: storage backend to import into. If not specified, the storage of the globally loaded profile is
+        used, which is the natural mode for CLI usage (e.g. in an aiida pod, where the profile is loaded globally).
+        Pass it explicitly when no profile is loaded globally, such as in a service process managing several
+        profiles at once. The shared repository must already be registered in the profile's storage configuration
+        (``shared_repositories``) in this mode: registering it requires writing the global profile configuration.
+    :return: dict with ``data_nodes`` and ``groups`` lists of imported entities and the ``uuid_map`` mapping the
+        manifest source UUIDs to the imported nodes.
     """
     from aiida import orm
     from aiida.manage import get_manager
@@ -234,6 +262,13 @@ def import_shared_collection(
 
     # Register shared repository if credentials provided
     if credentials:
+        if backend is not None:
+            raise ValueError(
+                '`credentials` cannot be combined with an explicit `backend`: registering a shared repository '
+                'writes the configuration of the globally loaded profile. Pass `backend=None` (and load the '
+                'profile globally), or register the shared repository in the storage configuration of the '
+                'profile behind `backend` beforehand.'
+            )
         add_shared_repository(
             name=shared_name,
             endpoint_url=manifest['source']['endpoint_url'],
@@ -242,7 +277,7 @@ def import_shared_collection(
             bucket_name=manifest['source']['bucket_name'],
         )
 
-    backend = get_manager().get_profile_storage()
+    backend = backend or get_manager().get_profile_storage()
     repository = backend.get_repository()
 
     # Ensure we have a multi-repository backend
@@ -318,11 +353,11 @@ def import_shared_collection(
                     content = handle.read()
 
                 # Create with real content (parsing works correctly)
-                node = node_class(io.BytesIO(content), filename=filename)
+                node = node_class(io.BytesIO(content), filename=filename, backend=backend)
             else:
-                node = node_class()
+                node = node_class(backend=backend)
         else:
-            node = node_class()
+            node = node_class(backend=backend)
 
         # Set attributes (skip filename for SinglefileData - set by constructor)
         for key, value in node_data.get('attributes', {}).items():
@@ -339,26 +374,40 @@ def import_shared_collection(
         if node_data.get('description'):
             node.description = node_data['description']
 
-        # Store the node (uploads placeholder to primary bucket)
+        # Store the node (uploads the file content to the primary bucket as a placeholder)
         node.store()
 
         # Now redirect repository to shared S3 (no data duplication)
         if shared_keys:
+            # The placeholder keys this store() wrote to the primary bucket, to be
+            # deleted after the redirect: exactly the keys of this node, never
+            # anything else (the primary bucket also contains objects of
+            # unrelated nodes, which must not be touched)
+            placeholder_keys = [
+                key for _, key in iter_repository_keys(node.backend_entity.repository_metadata or {})
+            ]
+
             # Replace repository_metadata with shared keys
             node.backend_entity.repository_metadata = metadata
 
             # Reset the repository cache so it rebuilds from new metadata
             node.base.repository._repository_instance = None
 
-            # Delete the placeholder objects from primary bucket
-            primary_repo = repository._primary if isinstance(repository, MultiS3RepositoryBackend) else repository
-            primary_keys = list(primary_repo.list_objects())
-            keys_to_delete = [k for k in primary_keys if k not in shared_keys]
-            if keys_to_delete:
+            # Delete the placeholder objects from the primary bucket. The
+            # multi-repository backend routes them to the primary backend
+            # (they are not shared-namespaced).
+            if placeholder_keys:
                 try:
-                    primary_repo.delete_objects(keys_to_delete)
-                except Exception:
-                    pass  # Best effort cleanup
+                    repository.delete_objects(placeholder_keys)
+                except Exception as exception:
+                    # The node already references the shared objects correctly;
+                    # a failed cleanup only leaks the placeholder bytes in the
+                    # primary bucket
+                    logger.warning(
+                        'Failed to delete placeholder objects %s from the primary repository: %s',
+                        placeholder_keys,
+                        exception,
+                    )
 
         uuid_map[source_uuid] = node
         imported_data_nodes.append(node)
@@ -375,7 +424,7 @@ def import_shared_collection(
 
         # Create new group
         label = label_prefix + group_data['label'] if label_prefix else group_data['label']
-        group = group_class(label=label)
+        group = group_class(label=label, backend=backend)
         if group_data.get('description'):
             group.description = group_data['description']
 

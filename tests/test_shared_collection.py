@@ -373,11 +373,16 @@ class TestSharedCollection:
             pseudo = imported_family.get_pseudo('Si')
             metadata = pseudo.backend_entity.repository_metadata or {}
             from aiida_s3.shared_collection import iter_repository_keys
+            from aiida_s3.repository.multi import split_shared_key
             shared_key = list(dict(iter_repository_keys(metadata)).values())[0]
 
-            with pytest.raises(PermissionError, match='Cannot delete objects in shared repositories'):
-                user1_repo.delete_objects([shared_key])
-            print('  ✓ Deleting shared objects is correctly forbidden')
+            # Default soft-delete: deleting a shared object removes only the reference,
+            # the S3 object in the shared bucket is preserved (soft_delete_shared)
+            user1_repo.delete_objects([shared_key])
+            _, object_key = split_shared_key(shared_key)
+            s3_object_keys_user2 = list_bucket_objects(s3_client, buckets['user2'])
+            assert object_key in s3_object_keys_user2, 'shared S3 object must be preserved by soft delete'
+            print('  ✓ Soft delete of shared object preserves the S3 object in the shared bucket')
 
             # ============================================================
             # SUMMARY
@@ -392,7 +397,7 @@ class TestSharedCollection:
             print(f'  Cutoffs: preserved ✓')
             print(f'  Content: readable via aiida API ✓')
             print(f'  No data duplication: ✓')
-            print(f'  Read-only enforcement: ✓')
+            print(f'  Shared object preservation on delete: ✓')
             print('=' * 70)
             print('ALL TESTS PASSED!')
             print('=' * 70)
@@ -503,3 +508,168 @@ class TestSharedCollection:
             print('Content verified ✓')
 
             print('ARBITRARY COLLECTION TEST PASSED!')
+
+    def test_import_with_explicit_backend_no_global_profile(
+        self,
+        s3_test_config: dict[str, t.Any],
+        config_psql_dos,
+        aiida_config,
+        aiida_profile_factory,
+        tmp_path_factory,
+    ):
+        """Import must work with an explicit storage backend while the target profile is NOT the globally loaded one.
+
+        This is the DashboardServer temporal worker mode: the worker manages its own aiida
+        Managers and passes the storage backend explicitly (the aiidasdk AiidaConnectionManager
+        pattern), so the import must never consult the global profile. The globally loaded
+        profile during the import is the unrelated session test profile: if any code path
+        fell back to it, nodes would land in the wrong storage or the global profile would
+        be switched.
+        """
+        from aiida import orm
+        from aiida.manage import get_manager
+        from aiida.manage.configuration import get_profile
+        from aiida.manage.configuration.profile import Profile
+        from aiida.manage.manager import Manager
+        from aiida_pseudo.data.pseudo.upf import UpfData
+        from aiida_pseudo.groups.family.sssp import SsspFamily
+        from aiida_s3.repository.multi import MultiS3RepositoryBackend
+        from aiida_s3.shared_collection import export_shared_collection, import_shared_collection
+
+        buckets = s3_test_config['_buckets']
+        s3_client = get_s3_client()
+        tmp_path = tmp_path_factory.mktemp('explicit_backend_test')
+        shared_name = 'explicit-shared'
+        family_label = 'SSSP/1.3/PBE/efficiency'
+
+        # Phase 1: user2 creates the pseudo family and exports it with an explicit backend
+        user2_config = config_psql_dos()
+        user2_config.update({
+            'endpoint_url': s3_test_config['endpoint_url'],
+            'access_key_id': s3_test_config['access_key_id'],
+            'secret_access_key': s3_test_config['secret_access_key'],
+            'bucket_name': buckets['user2'],
+        })
+
+        with aiida_profile_factory(
+            aiida_config,
+            storage_backend='s3.psql_s3',
+            storage_config=user2_config,
+            name='user2-explicit-test',
+        ) as user2_profile:
+            pseudos_created = {}
+            for element, filename in TEST_PSEUDOS.items():
+                upf_path = UPF_DIR / filename
+                if not upf_path.exists():
+                    print(f'  WARNING: {upf_path} not found, skipping {element}')
+                    continue
+                pseudo = UpfData(upf_path)
+                pseudo.store()
+                pseudos_created[element] = pseudo
+
+            family = SsspFamily(label=family_label)
+            family.description = 'Family exported with an explicit backend'
+            family.store()
+            family.add_nodes(list(pseudos_created.values()))
+            family.set_cutoffs(TEST_CUTOFFS, stringency='efficiency', unit='eV')
+
+            manifest_path = tmp_path / 'explicit.json'
+            export_shared_collection(
+                data_nodes=list(pseudos_created.values()),
+                groups=[family],
+                output=manifest_path,
+                shared_name=shared_name,
+                backend=get_manager().get_profile_storage(),
+            )
+            print(f'  Exported {len(pseudos_created)} nodes with explicit backend')
+
+        # Phase 2: user1 target profile - create and initialise it, then leave the profile
+        # context: the global profile is restored to the unrelated session test profile
+        user1_config = config_psql_dos()
+        user1_config.update({
+            'endpoint_url': s3_test_config['endpoint_url'],
+            'access_key_id': s3_test_config['access_key_id'],
+            'secret_access_key': s3_test_config['secret_access_key'],
+            'bucket_name': buckets['user1'],
+            'shared_repositories': [
+                {
+                    'name': shared_name,
+                    'endpoint_url': s3_test_config['endpoint_url'],
+                    'access_key_id': s3_test_config['access_key_id'],
+                    'secret_access_key': s3_test_config['secret_access_key'],
+                    'bucket_name': buckets['user2'],
+                }
+            ],
+        })
+
+        with aiida_profile_factory(
+            aiida_config,
+            storage_backend='s3.psql_s3',
+            storage_config=user1_config,
+            name='user1-explicit-test',
+        ) as user1_profile:
+            user1_dictionary = dict(user1_profile.dictionary)
+
+        global_profile = get_profile()
+        assert global_profile is not None, 'the session test profile should be loaded globally'
+        assert global_profile.name != user1_profile.name, 'the target profile must NOT be the global one'
+        global_backend = get_manager().get_profile_storage()
+        nodes_in_global_storage_before = orm.QueryBuilder(backend=global_backend).append(orm.Node).count()
+
+        # Phase 3: import through a private Manager over the target profile, the
+        # aiidasdk AiidaConnectionManager pattern: no global profile involved
+        manager = Manager()
+        manager.load_profile(Profile(user1_profile.name, user1_dictionary))
+        try:
+            backend = manager.get_profile_storage()
+            assert isinstance(backend.get_repository(), MultiS3RepositoryBackend)
+            assert backend is not global_backend
+
+            # credentials registration is incompatible with an explicit backend
+            with pytest.raises(ValueError, match='credentials'):
+                import_shared_collection(
+                    manifest_path=manifest_path,
+                    shared_name=shared_name,
+                    credentials={'access_key_id': 'x', 'secret_access_key': 'y'},
+                    backend=backend,
+                )
+
+            result = import_shared_collection(
+                manifest_path=manifest_path,
+                shared_name=shared_name,
+                backend=backend,
+            )
+
+            # the import must not have switched or touched the global profile
+            assert get_profile() is global_profile, 'import must not switch the global profile'
+            assert get_manager().get_profile_storage() is global_backend
+            nodes_in_global_storage_after = orm.QueryBuilder(backend=global_backend).append(orm.Node).count()
+            assert nodes_in_global_storage_after == nodes_in_global_storage_before, \
+                'import must not write anything to the storage of the global profile'
+
+            assert len(result['data_nodes']) == len(pseudos_created)
+            assert len(result['groups']) == 1
+
+            # no data duplication: user1's bucket stays empty
+            assert len(list(backend.get_repository().list_objects())) == 0
+            assert len(list_bucket_objects(s3_client, buckets['user1'])) == 0
+
+            # the shared bucket still holds the objects
+            assert len(list_bucket_objects(s3_client, buckets['user2'])) > 0
+
+            # reload the family through the explicit backend only and verify it is functional
+            qb = orm.QueryBuilder(backend=backend)
+            qb.append(SsspFamily, filters={'label': family_label})
+            imported_family = qb.one()[0]
+            assert set(imported_family.elements) == set(pseudos_created.keys())
+            assert imported_family.get_cutoffs('efficiency')['Si']['cutoff_wfc'] == TEST_CUTOFFS['Si']['cutoff_wfc']
+
+            pseudo = imported_family.get_pseudo('Si')
+            with pseudo.open(mode='rb') as handle:
+                assert handle.read() == (UPF_DIR / TEST_PSEUDOS['Si']).read_bytes()
+            print('  Content read through the shared bucket via the explicit backend ✓')
+        finally:
+            manager.unload_profile()
+
+        assert get_profile() is global_profile
+        print('EXPLICIT BACKEND (NO GLOBAL PROFILE) TEST PASSED!')
