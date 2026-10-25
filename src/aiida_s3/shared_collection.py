@@ -301,6 +301,23 @@ def import_shared_collection(
     imported_data_nodes: list[orm.Data] = []
     imported_groups: list[orm.Group] = []
 
+    # Verify every shared object exists with ONE repository query. The S3
+    # repository resolves has_objects by listing the bucket, so calling it
+    # once per file made the import O(files x bucket-size): a full bucket
+    # listing for every file of every node (~thousands of list requests).
+    all_shared_keys = {
+        make_shared_key(shared_name, file_info['s3_key'])
+        for node_data in manifest['data_nodes']
+        for file_info in node_data.get('repository_files', [])
+    }
+    existing_shared_keys: set[str] = set()
+    if all_shared_keys:
+        for shared_key, exists in zip(
+            all_shared_keys, repository.has_objects(sorted(all_shared_keys))
+        ):
+            if exists:
+                existing_shared_keys.add(shared_key)
+
     # Import data nodes
     for node_data in manifest['data_nodes']:
         source_uuid = node_data['source_uuid']
@@ -320,8 +337,8 @@ def import_shared_collection(
             s3_key = file_info['s3_key']
             shared_key = make_shared_key(shared_name, s3_key)
 
-            # Verify object exists in shared bucket
-            if not repository.has_objects([shared_key])[0]:
+            # Verified up front (see the batched has_objects above)
+            if shared_key not in existing_shared_keys:
                 raise FileNotFoundError(
                     f"Object '{s3_key}' not found in shared bucket '{shared_name}'"
                 )
