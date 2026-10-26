@@ -312,8 +312,9 @@ def cmd_collection_import(
     """Import a shared collection manifest into the current profile.
 
     Creates new Data nodes and Groups, with repository files referenced by key
-    in the shared S3 bucket. No data is uploaded or downloaded (except for
-    validation during node creation, which is then cleaned up).
+    in the shared S3 bucket. No object bytes are uploaded or downloaded: the
+    nodes are created empty with their repository metadata pre-armed at the
+    shared keys (one DB insert per node, zero S3 content requests).
     """
     from aiida_s3.shared_collection import COLLECTION_FORMAT, import_shared_collection
 
