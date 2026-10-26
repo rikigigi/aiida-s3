@@ -353,33 +353,25 @@ def import_shared_collection(
             if parts:
                 current[parts[-1]] = {'k': shared_key}
 
-        # Strategy: read content from shared bucket, create node with real content,
-        # store it, then redirect to shared S3 and delete from primary bucket
-        import io
+        # No data transfer: the manifest already carries everything the
+        # exported node had computed (the parsed metadata lives in the
+        # attributes) and every shared object was verified above. The node
+        # is created EMPTY and its repository metadata is pre-armed with
+        # the shared keys: with a non-sandbox repository backend,
+        # NodeRepository._store() skips the sandbox clone entirely and
+        # store() persists the metadata directly - one DB insert, zero S3
+        # requests per node.
+        # The previous strategy (read the content so the constructor could
+        # re-parse it, store a placeholder copy in the primary bucket, then
+        # redirect the metadata and delete the placeholder) moved the full
+        # file three times per node and redid the parsing the source
+        # profile had already done: a metadata-only import cannot afford
+        # that, an import of ~2500 pseudos took minutes instead of seconds.
+        node = node_class(backend=backend)
 
-        if node_data.get('repository_files'):
-            # Use first file's path as the filename
-            first_file = node_data['repository_files'][0]
-            filename = pathlib.Path(first_file['path']).name
-
-            if issubclass(node_class, orm.SinglefileData):
-                # Read content from shared bucket for node creation
-                # (needed for UpfData parsing, then we redirect to shared S3)
-                shared_key = shared_keys[0]
-                with repository.open(shared_key) as handle:
-                    content = handle.read()
-
-                # Create with real content (parsing works correctly)
-                node = node_class(io.BytesIO(content), filename=filename, backend=backend)
-            else:
-                node = node_class(backend=backend)
-        else:
-            node = node_class(backend=backend)
-
-        # Set attributes (skip filename for SinglefileData - set by constructor)
+        # Set attributes (the parsed metadata of the exported node)
         for key, value in node_data.get('attributes', {}).items():
-            if key != 'filename':
-                node.base.attributes.set(key, value)
+            node.base.attributes.set(key, value)
 
         # Set extras
         for key, value in node_data.get('extras', {}).items():
@@ -391,40 +383,18 @@ def import_shared_collection(
         if node_data.get('description'):
             node.description = node_data['description']
 
-        # Store the node (uploads the file content to the primary bucket as a placeholder)
-        node.store()
-
-        # Now redirect repository to shared S3 (no data duplication)
+        # Pre-arm the repository with the shared keys: no content is read
+        # or written, the node simply references the shared objects
         if shared_keys:
-            # The placeholder keys this store() wrote to the primary bucket, to be
-            # deleted after the redirect: exactly the keys of this node, never
-            # anything else (the primary bucket also contains objects of
-            # unrelated nodes, which must not be touched)
-            placeholder_keys = [
-                key for _, key in iter_repository_keys(node.backend_entity.repository_metadata or {})
-            ]
+            from aiida.repository import Repository
 
-            # Replace repository_metadata with shared keys
-            node.backend_entity.repository_metadata = metadata
+            node.base.repository._repository = Repository.from_serialized(
+                backend=node.backend.get_repository(), serialized=metadata
+            )
 
-            # Reset the repository cache so it rebuilds from new metadata
-            node.base.repository._repository_instance = None
-
-            # Delete the placeholder objects from the primary bucket. The
-            # multi-repository backend routes them to the primary backend
-            # (they are not shared-namespaced).
-            if placeholder_keys:
-                try:
-                    repository.delete_objects(placeholder_keys)
-                except Exception as exception:
-                    # The node already references the shared objects correctly;
-                    # a failed cleanup only leaks the placeholder bytes in the
-                    # primary bucket
-                    logger.warning(
-                        'Failed to delete placeholder objects %s from the primary repository: %s',
-                        placeholder_keys,
-                        exception,
-                    )
+        # Store the node: with the pre-armed repository the metadata goes
+        # straight into the backend node row (no placeholder upload)
+        node.store()
 
         uuid_map[source_uuid] = node
         imported_data_nodes.append(node)
