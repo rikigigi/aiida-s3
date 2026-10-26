@@ -80,6 +80,49 @@ COLLECTION_FORMAT = 'aiida-s3-shared-collection/1'
 logger = logging.getLogger(__name__)
 
 
+def _pseudo_base_class(node_class: type) -> type | None:
+    """Return the aiida-pseudo base class in the MRO of ``node_class``, if any.
+
+    The base class overrides ``store()`` to re-validate the md5 by re-reading
+    the file content - ``PseudoPotential`` in aiida-pseudo < 1.10,
+    ``PseudoPotentialData`` from 1.10 on (same pattern, renamed class).
+    """
+    from aiida_pseudo.data import pseudo as pseudo_module
+
+    for name in ('PseudoPotentialData', 'PseudoPotential'):
+        pseudo_base = getattr(pseudo_module, name, None)
+        if pseudo_base is None:
+            continue
+        if any(cls is pseudo_base for cls in node_class.__mro__):
+            return pseudo_base
+    return None
+
+
+def _store_node(node: t.Any, node_class: type) -> t.Any:
+    """Store an imported node, bypassing the aiida-pseudo md5 re-validation.
+
+    ``aiida-pseudo``'s ``store()`` calls ``validate_md5()``, which downloads the
+    full file content from the repository backend only to recompute a checksum.
+    For a metadata-only import that re-downloads every shared object - the exact
+    cost the import exists to avoid (profiling a 103-node SSSP fixture: 86% of
+    the wall time, all of it in ``validate_md5`` -> S3 GET) - and it re-proves
+    what cannot have changed: the ``md5`` attribute comes from the export
+    manifest, which recorded it from these very objects, and the shared bucket
+    is read-only (its objects were verified to exist by ``has_objects`` above).
+
+    The bypass invokes the parent implementation directly: no monkey-patching
+    of shared class state (the import runs on worker threads alongside other
+    activities in the same process) and aiida-core's own ``store()`` checks
+    (storability, links, caching, value cleaning) still run. The validating
+    override is skipped only for pseudo nodes; every other class stores
+    normally.
+    """
+    pseudo_base = _pseudo_base_class(node_class)
+    if pseudo_base is not None:
+        return super(pseudo_base, node).store()
+    return node.store()
+
+
 def iter_repository_keys(metadata: dict[str, t.Any], prefix: str = '') -> t.Iterator[tuple[str, str]]:
     """Yield ``(path, key)`` tuples for every file entry in node repository metadata."""
     if 'k' in metadata:
@@ -393,8 +436,10 @@ def import_shared_collection(
             )
 
         # Store the node: with the pre-armed repository the metadata goes
-        # straight into the backend node row (no placeholder upload)
-        node.store()
+        # straight into the backend node row (no placeholder upload), and the
+        # md5 re-validation is skipped (see _store_node): re-hashing the file
+        # would re-download it from the shared bucket
+        _store_node(node, node_class)
 
         uuid_map[source_uuid] = node
         imported_data_nodes.append(node)

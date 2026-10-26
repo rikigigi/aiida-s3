@@ -673,3 +673,142 @@ class TestSharedCollection:
 
         assert get_profile() is global_profile
         print('EXPLICIT BACKEND (NO GLOBAL PROFILE) TEST PASSED!')
+
+    def test_import_bypasses_md5_revalidation_no_content_read(
+        self,
+        s3_test_config: dict[str, t.Any],
+        config_psql_dos,
+        aiida_config,
+        aiida_profile_factory,
+        tmp_path_factory,
+        monkeypatch,
+    ):
+        """The metadata-only import must not read any file content while storing.
+
+        aiida-pseudo's store() re-validates the md5 by re-reading the file,
+        which for a shared repository means downloading the object from the
+        shared bucket. The import bypasses that override via super() (no
+        monkey-patching), so during the import: validate_md5 must never be
+        called and the repository must never open() an object. If the bypass
+        regressed, both spies below would catch it while still delegating to
+        the real implementations (the import would succeed, but the test
+        would see the calls).
+        """
+        import io
+
+        from aiida.manage import get_manager
+        from aiida.manage.configuration import get_profile
+        from aiida.manage.configuration.profile import Profile
+        from aiida.manage.manager import Manager
+        from aiida_pseudo.data.pseudo import upf
+        from aiida_s3.repository import multi as multi_repository_module
+        from aiida_s3.shared_collection import export_shared_collection, import_shared_collection
+
+        buckets = s3_test_config['_buckets']
+        tmp_path = tmp_path_factory.mktemp('bypass_md5_test')
+        shared_name = 'bypass-md5-shared'
+
+        # Phase 1: export one UpfData node from user2
+        user2_config = config_psql_dos()
+        user2_config.update({
+            'endpoint_url': s3_test_config['endpoint_url'],
+            'access_key_id': s3_test_config['access_key_id'],
+            'secret_access_key': s3_test_config['secret_access_key'],
+            'bucket_name': buckets['user2'],
+        })
+
+        with aiida_profile_factory(
+            aiida_config,
+            storage_backend='s3.psql_s3',
+            storage_config=user2_config,
+            name='user2-bypass-md5-test',
+        ):
+            upf_path = UPF_DIR / TEST_PSEUDOS['H']
+            source_pseudo = upf.UpfData(upf_path)
+            source_pseudo.store()
+            source_md5 = source_pseudo.md5
+
+            manifest_path = tmp_path / 'bypass.json'
+            export_shared_collection(
+                data_nodes=[source_pseudo],
+                groups=None,
+                output=manifest_path,
+                shared_name=shared_name,
+            )
+
+        # Phase 2: prepare the user1 profile with the shared repository
+        user1_config = config_psql_dos()
+        user1_config.update({
+            'endpoint_url': s3_test_config['endpoint_url'],
+            'access_key_id': s3_test_config['access_key_id'],
+            'secret_access_key': s3_test_config['secret_access_key'],
+            'bucket_name': buckets['user1'],
+            'shared_repositories': [
+                {
+                    'name': shared_name,
+                    'endpoint_url': s3_test_config['endpoint_url'],
+                    'access_key_id': s3_test_config['access_key_id'],
+                    'secret_access_key': s3_test_config['secret_access_key'],
+                    'bucket_name': buckets['user2'],
+                }
+            ],
+        })
+
+        with aiida_profile_factory(
+            aiida_config,
+            storage_backend='s3.psql_s3',
+            storage_config=user1_config,
+            name='user1-bypass-md5-test',
+        ) as user1_profile:
+            user1_dictionary = dict(user1_profile.dictionary)
+
+        # spies: count the calls, delegate to the real implementations
+        calls: dict[str, int] = {'validate_md5': 0, 'open': 0}
+
+        pseudo_base = type(source_pseudo).__mro__[
+            next(i for i, cls in enumerate(type(source_pseudo).__mro__) if 'validate_md5' in vars(cls))
+        ]
+        original_validate = pseudo_base.validate_md5
+        original_open = multi_repository_module.MultiS3RepositoryBackend.open
+
+        def spy_validate(instance, md5):
+            calls['validate_md5'] += 1
+            return original_validate(instance, md5)
+
+        def spy_open(instance, *args, **kwargs):
+            calls['open'] += 1
+            return original_open(instance, *args, **kwargs)
+
+        monkeypatch.setattr(pseudo_base, 'validate_md5', spy_validate)
+        monkeypatch.setattr(multi_repository_module.MultiS3RepositoryBackend, 'open', spy_open)
+
+        # Phase 3: import through a private Manager (the temporal worker mode)
+        global_profile = get_profile()
+        manager = Manager()
+        manager.load_profile(Profile(user1_profile.name, user1_dictionary))
+        try:
+            backend = manager.get_profile_storage()
+
+            result = import_shared_collection(
+                manifest_path=manifest_path,
+                shared_name=shared_name,
+                backend=backend,
+            )
+
+            assert get_profile() is global_profile
+
+            assert len(result['data_nodes']) == 1
+            imported = result['data_nodes'][0]
+
+            # THE assertion: nothing re-read the file content during the import
+            assert calls['validate_md5'] == 0, 'validate_md5 must be bypassed on import'
+            assert calls['open'] == 0, 'the repository must not open (download) any object on import'
+
+            # the stored node carries the exported md5 and the file stays readable
+            assert imported.md5 == source_md5
+            with imported.open(mode='rb') as handle:
+                assert handle.read() == upf_path.read_bytes()
+            print('  No content read during import; content still readable through the shared bucket')
+        finally:
+            manager.unload_profile()
+        print('IMPORT BYPASSES MD5 REVALIDATION (NO CONTENT READ) TEST PASSED!')
