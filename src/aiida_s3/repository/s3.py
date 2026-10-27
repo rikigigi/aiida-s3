@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import tempfile
 import typing as t
@@ -14,6 +15,9 @@ from aiida.repository.backend.abstract import AbstractRepositoryBackend
 __all__ = ('S3RepositoryBackend',)
 
 MAX_DELETE_OBJECTS = 1000
+
+#: Maximum number of concurrent HEAD requests used to resolve ``has_objects``.
+MAX_HAS_OBJECTS_WORKERS = 8
 
 
 class S3RepositoryBackend(AbstractRepositoryBackend):
@@ -135,12 +139,35 @@ class S3RepositoryBackend(AbstractRepositoryBackend):
     def has_objects(self, keys: list[str]) -> list[bool]:
         """Return whether the repository has an object with the given key.
 
+        Each key is resolved with a single HEAD request, so the cost is
+        O(len(keys)) regardless of the bucket size. The previous
+        implementation listed the entire bucket for every call: callers that
+        verify large key sets (e.g. ``import_shared_collection`` checking a
+        manifest against a shared bucket) paged through the whole bucket on
+        every import, and per-key callers paid a full listing per key.
+
         :param keys: list of fully qualified identifiers for objects within the repository.
         :return: list of booleans, in the same order as the keys provided, with value True if the respective object
             exists and False otherwise.
         """
-        existing_keys = set(self.list_objects())
-        return [key in existing_keys for key in keys]
+        if not keys:
+            return []
+
+        def has_object(key: str) -> bool:
+            try:
+                self._client.head_object(Bucket=self._bucket_name, Key=key)
+            except botocore.exceptions.ClientError:
+                return False
+            return True
+
+        if len(keys) == 1:
+            return [has_object(keys[0])]
+
+        workers = min(len(keys), MAX_HAS_OBJECTS_WORKERS)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            # boto3 clients are thread-safe for API calls; executor.map
+            # preserves the input order
+            return list(executor.map(has_object, keys))
 
     @contextlib.contextmanager
     def open(self, key: str) -> t.Iterator[t.IO[bytes]]:  # type: ignore[override]
